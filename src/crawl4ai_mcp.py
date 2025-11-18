@@ -35,6 +35,19 @@ from utils import (
     extract_source_summary,
     search_code_examples
 )
+from safety import require_public_http_url, is_public_http_url
+from persistence import (
+    generate_run_id,
+    ensure_run_dir,
+    persist_page_markdown,
+    append_links_csv,
+    Manifest,
+    PageRecord,
+    write_manifest,
+    update_totals
+)
+from adaptive_strategy import should_continue_crawling
+from sitemap_utils import discover_sitemaps, parse_sitemap_xml, filter_urls, fetch_text
 
 # Load environment variables from the project root .env file
 project_root = Path(__file__).resolve().parent.parent
@@ -266,7 +279,7 @@ def process_code_example(args):
     return generate_code_example_summary(code, context_before, context_after)
 
 @mcp.tool()
-async def crawl_single_page(ctx: Context, url: str) -> str:
+async def crawl_single_page(ctx: Context, url: str, output_dir: Optional[str] = None) -> str:
     """
     Crawl a single web page and store its content in Supabase.
     
@@ -276,9 +289,11 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
     Args:
         ctx: The MCP server provided context
         url: URL of the web page to crawl
+        output_dir: Optional directory to persist content to disk. If provided, content is saved to files
+                    and metadata is returned instead of full content (avoids context bloat).
     
     Returns:
-        Summary of the crawling operation and storage in Supabase
+        Summary of the crawling operation and storage in Supabase (or file persistence if output_dir provided)
     """
     try:
         # Validate URL
@@ -294,6 +309,16 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
                 "success": False,
                 "url": url,
                 "error": f"Invalid URL format: '{url}'. URL must start with 'http://' or 'https://'"
+            }, indent=2)
+        
+        # Safety check: ensure URL is public
+        try:
+            require_public_http_url(url)
+        except ValueError as e:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": str(e)
             }, indent=2)
         
         # Get the crawler from the context
@@ -319,6 +344,66 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
         result = await crawler.arun(url=url, config=run_config)
         
         if result.success and result.markdown:
+            # Handle file persistence if output_dir is provided
+            if output_dir:
+                from datetime import datetime, timezone
+                run_id = generate_run_id("scrape")
+                run_dir = ensure_run_dir(output_dir, run_id)
+                started_at = datetime.now(timezone.utc)
+                
+                # Create manifest
+                manifest = Manifest(
+                    run_id=run_id,
+                    entry=url,
+                    mode="scrape",
+                    started_at=started_at.isoformat(),
+                    config={"url": url}
+                )
+                write_manifest(run_dir, manifest)
+                
+                # Persist page to disk
+                file_path, content_bytes = persist_page_markdown(run_dir, url, result.markdown)
+                
+                # Extract links
+                links = []
+                raw_links = getattr(result, "links", {}) or {}
+                for link_list in [raw_links.get("internal", []), raw_links.get("external", [])]:
+                    for link in link_list:
+                        if isinstance(link, str):
+                            links.append(link)
+                        else:
+                            href = link.get("href") or link.get("url")
+                            if isinstance(href, str):
+                                links.append(href)
+                
+                if links:
+                    append_links_csv(run_dir, url, links)
+                
+                # Create page record
+                page_record = PageRecord(
+                    url=url,
+                    status="ok",
+                    error=None,
+                    duration_ms=0,
+                    path=file_path,
+                    content_bytes=content_bytes
+                )
+                manifest.pages = [page_record]
+                manifest.finished_at = datetime.now(timezone.utc).isoformat()
+                manifest.totals = {"pages_ok": 1, "pages_failed": 0, "bytes_written": content_bytes}
+                write_manifest(run_dir, manifest)
+                
+                return json.dumps({
+                    "success": True,
+                    "run_id": run_id,
+                    "output_dir": str(run_dir),
+                    "manifest_path": str(run_dir / "manifest.json"),
+                    "file_path": file_path,
+                    "bytes_written": content_bytes,
+                    "started_at": started_at.isoformat(),
+                    "finished_at": manifest.finished_at
+                }, indent=2)
+            
             # Extract source_id
             parsed_url = urlparse(url)
             source_id = parsed_url.netloc or parsed_url.path
@@ -519,6 +604,16 @@ async def crawl_single_page_raw(ctx: Context, url: str) -> str:
                 "error": f"Invalid URL format: '{url}'. URL must start with 'http://' or 'https://'"
             }, indent=2)
         
+        # Safety check: ensure URL is public
+        try:
+            require_public_http_url(url)
+        except ValueError as e:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": str(e)
+            }, indent=2)
+        
         # Get the crawler from the context
         crawler = ctx.request_context.lifespan_context.crawler
         
@@ -565,12 +660,12 @@ async def crawl_single_page_raw(ctx: Context, url: str) -> str:
             }, indent=2)
 
 @mcp.tool()
-async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000) -> str:
+async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000, adaptive: bool = False, output_dir: Optional[str] = None) -> str:
     """
     Intelligently crawl a URL based on its type and store content in Supabase.
     
     This tool automatically detects the URL type and applies the appropriate crawling method:
-    - For sitemaps: Extracts and crawls all URLs in parallel
+    - For sitemaps: Extracts and crawls all URLs in parallel (also discovers sitemaps from robots.txt)
     - For text files (llms.txt): Directly retrieves the content
     - For regular webpages: Recursively crawls internal links up to the specified depth
     
@@ -581,7 +676,10 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         url: URL to crawl (can be a regular webpage, sitemap.xml, or .txt file)
         max_depth: Maximum recursion depth for regular URLs (default: 3)
         max_concurrent: Maximum number of concurrent browser sessions (default: 10)
-        chunk_size: Maximum size of each content chunk in characters (default: 1000)
+        chunk_size: Maximum size of each content chunk in characters (default: 5000)
+        adaptive: Enable adaptive crawling to stop when sufficient content is gathered (default: False)
+        output_dir: Optional directory to persist content to disk. If provided, content is saved to files
+                    and metadata is returned instead of full content (avoids context bloat).
     
     Returns:
         JSON string with crawl summary and storage information
@@ -600,6 +698,16 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 "success": False,
                 "url": url,
                 "error": f"Invalid URL format: '{url}'. URL must start with 'http://' or 'https://'"
+            }, indent=2)
+        
+        # Safety check: ensure URL is public
+        try:
+            require_public_http_url(url)
+        except ValueError as e:
+            return json.dumps({
+                "success": False,
+                "url": url,
+                "error": str(e)
             }, indent=2)
         
         # Validate parameters
@@ -650,18 +758,119 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                     "url": url,
                     "error": "No URLs found in sitemap"
                 }, indent=2)
-            crawl_results = await crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
+            # Filter URLs for safety
+            safe_urls = [u for u in sitemap_urls if is_public_http_url(u)]
+            if not safe_urls:
+                return json.dumps({
+                    "success": False,
+                    "url": url,
+                    "error": "No safe URLs found in sitemap after filtering"
+                }, indent=2)
+            crawl_results = await crawl_batch(crawler, safe_urls, max_concurrent=max_concurrent, adaptive=adaptive)
             crawl_type = "sitemap"
         else:
-            # For regular URLs, use recursive crawl
-            crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent)
-            crawl_type = "webpage"
+            # Try to discover sitemaps from robots.txt first
+            discovered_sitemaps = await discover_sitemaps(url)
+            if discovered_sitemaps:
+                # Use discovered sitemap if available
+                sitemap_url = discovered_sitemaps[0]
+                sitemap_text = await fetch_text(sitemap_url)
+                if sitemap_text:
+                    sitemap_urls = parse_sitemap_xml(sitemap_text)
+                    safe_urls = [u for u in sitemap_urls if is_public_http_url(u)]
+                    if safe_urls:
+                        crawl_results = await crawl_batch(crawler, safe_urls, max_concurrent=max_concurrent, adaptive=adaptive)
+                        crawl_type = "sitemap_discovered"
+            
+            # If no sitemap or sitemap crawl failed, use recursive crawl
+            if not crawl_results:
+                crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent, adaptive=adaptive)
+                crawl_type = "webpage"
         
         if not crawl_results:
             return json.dumps({
                 "success": False,
                 "url": url,
                 "error": "No content found"
+            }, indent=2)
+        
+        # Handle file persistence if output_dir is provided
+        if output_dir:
+            from datetime import datetime, timezone
+            run_id = generate_run_id("crawl")
+            run_dir = ensure_run_dir(output_dir, run_id)
+            started_at = datetime.now(timezone.utc)
+            
+            # Create manifest
+            manifest = Manifest(
+                run_id=run_id,
+                entry=url,
+                mode="crawl",
+                started_at=started_at.isoformat(),
+                config={
+                    "url": url,
+                    "max_depth": max_depth,
+                    "max_concurrent": max_concurrent,
+                    "adaptive": adaptive,
+                    "crawl_type": crawl_type
+                }
+            )
+            write_manifest(run_dir, manifest)
+            
+            pages_ok = 0
+            pages_failed = 0
+            total_bytes = 0
+            
+            # Persist each page
+            for doc in crawl_results:
+                try:
+                    file_path, content_bytes = persist_page_markdown(run_dir, doc['url'], doc['markdown'])
+                    
+                    # Extract links
+                    links = []
+                    # Links might be in the doc if we stored them, otherwise empty
+                    if links:
+                        append_links_csv(run_dir, doc['url'], links)
+                    
+                    page_record = PageRecord(
+                        url=doc['url'],
+                        status="ok",
+                        error=None,
+                        duration_ms=0,
+                        path=file_path,
+                        content_bytes=content_bytes
+                    )
+                    manifest.pages.append(page_record)
+                    update_totals(manifest, page_record)
+                    pages_ok += 1
+                    total_bytes += content_bytes
+                except Exception as e:
+                    page_record = PageRecord(
+                        url=doc['url'],
+                        status="failed",
+                        error=str(e),
+                        duration_ms=0,
+                        path=None,
+                        content_bytes=None
+                    )
+                    manifest.pages.append(page_record)
+                    update_totals(manifest, page_record)
+                    pages_failed += 1
+            
+            manifest.finished_at = datetime.now(timezone.utc).isoformat()
+            write_manifest(run_dir, manifest)
+            
+            return json.dumps({
+                "success": True,
+                "run_id": run_id,
+                "output_dir": str(run_dir),
+                "manifest_path": str(run_dir / "manifest.json"),
+                "pages_ok": pages_ok,
+                "pages_failed": pages_failed,
+                "bytes_written": total_bytes,
+                "started_at": started_at.isoformat(),
+                "finished_at": manifest.finished_at,
+                "crawl_type": crawl_type
             }, indent=2)
         
         # Process results and store in Supabase
@@ -1046,6 +1255,304 @@ async def get_available_sources(ctx: Context) -> str:
         }, indent=2)
 
 @mcp.tool()
+async def crawl_site(ctx: Context, entry_url: str, output_dir: str, max_depth: int = 2, max_pages: int = 200, adaptive: bool = False) -> str:
+    """
+    Comprehensive site crawling with persistence to disk.
+    
+    This tool crawls an entire website and persists all results to disk. It always requires
+    an output_dir and returns metadata only (avoids context bloat).
+    
+    Args:
+        ctx: The MCP server provided context
+        entry_url: Starting URL for site crawl
+        output_dir: Directory to persist results (required)
+        max_depth: Maximum crawl depth (default: 2, max: 6)
+        max_pages: Maximum pages to crawl (default: 200, max: 5000)
+        adaptive: Enable adaptive crawling to stop when sufficient content is gathered (default: False)
+    
+    Returns:
+        JSON string with crawl summary and file paths
+    """
+    try:
+        # Validate URL
+        if not entry_url or not entry_url.strip():
+            return json.dumps({
+                "success": False,
+                "url": entry_url,
+                "error": "URL is required and cannot be empty"
+            }, indent=2)
+        
+        if not entry_url.startswith(('http://', 'https://')):
+            return json.dumps({
+                "success": False,
+                "url": entry_url,
+                "error": f"Invalid URL format: '{entry_url}'. URL must start with 'http://' or 'https://'"
+            }, indent=2)
+        
+        # Safety check
+        try:
+            require_public_http_url(entry_url)
+        except ValueError as e:
+            return json.dumps({
+                "success": False,
+                "url": entry_url,
+                "error": str(e)
+            }, indent=2)
+        
+        # Validate parameters
+        if max_depth < 1 or max_depth > 6:
+            return json.dumps({
+                "success": False,
+                "url": entry_url,
+                "error": f"max_depth must be between 1 and 6, got {max_depth}"
+            }, indent=2)
+        
+        if max_pages < 1 or max_pages > 5000:
+            return json.dumps({
+                "success": False,
+                "url": entry_url,
+                "error": f"max_pages must be between 1 and 5000, got {max_pages}"
+            }, indent=2)
+        
+        # Use smart_crawl_url with output_dir (which will handle persistence)
+        # But we need to limit pages, so we'll do a custom crawl
+        crawler = ctx.request_context.lifespan_context.crawler
+        
+        from datetime import datetime, timezone
+        run_id = generate_run_id("site")
+        run_dir = ensure_run_dir(output_dir, run_id)
+        started_at = datetime.now(timezone.utc)
+        
+        # Create manifest
+        manifest = Manifest(
+            run_id=run_id,
+            entry=entry_url,
+            mode="site",
+            started_at=started_at.isoformat(),
+            config={
+                "entry_url": entry_url,
+                "max_depth": max_depth,
+                "max_pages": max_pages,
+                "adaptive": adaptive
+            }
+        )
+        write_manifest(run_dir, manifest)
+        
+        # Perform recursive crawl with page limit
+        crawl_results = await crawl_recursive_internal_links(
+            crawler, 
+            [entry_url], 
+            max_depth=max_depth, 
+            max_concurrent=10,
+            adaptive=adaptive
+        )
+        
+        # Limit to max_pages
+        crawl_results = crawl_results[:max_pages]
+        
+        pages_ok = 0
+        pages_failed = 0
+        total_bytes = 0
+        
+        # Persist each page
+        for doc in crawl_results:
+            try:
+                file_path, content_bytes = persist_page_markdown(run_dir, doc['url'], doc['markdown'])
+                
+                page_record = PageRecord(
+                    url=doc['url'],
+                    status="ok",
+                    error=None,
+                    duration_ms=0,
+                    path=file_path,
+                    content_bytes=content_bytes
+                )
+                manifest.pages.append(page_record)
+                update_totals(manifest, page_record)
+                pages_ok += 1
+                total_bytes += content_bytes
+            except Exception as e:
+                page_record = PageRecord(
+                    url=doc['url'],
+                    status="failed",
+                    error=str(e),
+                    duration_ms=0,
+                    path=None,
+                    content_bytes=None
+                )
+                manifest.pages.append(page_record)
+                update_totals(manifest, page_record)
+                pages_failed += 1
+        
+        manifest.finished_at = datetime.now(timezone.utc).isoformat()
+        write_manifest(run_dir, manifest)
+        
+        return json.dumps({
+            "success": True,
+            "run_id": run_id,
+            "output_dir": str(run_dir),
+            "manifest_path": str(run_dir / "manifest.json"),
+            "pages_ok": pages_ok,
+            "pages_failed": pages_failed,
+            "bytes_written": total_bytes,
+            "started_at": started_at.isoformat(),
+            "finished_at": manifest.finished_at
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "url": entry_url,
+            "error": str(e)
+        }, indent=2)
+
+@mcp.tool()
+async def crawl_sitemap(ctx: Context, sitemap_url: str, output_dir: str, max_entries: int = 1000) -> str:
+    """
+    Crawl URLs discovered from sitemap.xml with persistence to disk.
+    
+    This tool fetches a sitemap, extracts URLs, and crawls them all while persisting
+    results to disk. It always requires an output_dir and returns metadata only.
+    
+    Args:
+        ctx: The MCP server provided context
+        sitemap_url: URL to sitemap.xml
+        output_dir: Directory to persist results (required)
+        max_entries: Maximum sitemap entries to process (default: 1000)
+    
+    Returns:
+        JSON string with crawl summary and file paths
+    """
+    try:
+        # Validate URL
+        if not sitemap_url or not sitemap_url.strip():
+            return json.dumps({
+                "success": False,
+                "url": sitemap_url,
+                "error": "URL is required and cannot be empty"
+            }, indent=2)
+        
+        if not sitemap_url.startswith(('http://', 'https://')):
+            return json.dumps({
+                "success": False,
+                "url": sitemap_url,
+                "error": f"Invalid URL format: '{sitemap_url}'. URL must start with 'http://' or 'https://'"
+            }, indent=2)
+        
+        # Safety check
+        try:
+            require_public_http_url(sitemap_url)
+        except ValueError as e:
+            return json.dumps({
+                "success": False,
+                "url": sitemap_url,
+                "error": str(e)
+            }, indent=2)
+        
+        # Fetch and parse sitemap
+        sitemap_text = await fetch_text(sitemap_url)
+        if not sitemap_text:
+            return json.dumps({
+                "success": False,
+                "url": sitemap_url,
+                "error": "Failed to fetch sitemap"
+            }, indent=2)
+        
+        sitemap_urls = parse_sitemap_xml(sitemap_text)
+        if not sitemap_urls:
+            return json.dumps({
+                "success": False,
+                "url": sitemap_url,
+                "error": "No URLs found in sitemap"
+            }, indent=2)
+        
+        # Filter for safety and limit entries
+        safe_urls = [u for u in sitemap_urls if is_public_http_url(u)][:max_entries]
+        if not safe_urls:
+            return json.dumps({
+                "success": False,
+                "url": sitemap_url,
+                "error": "No safe URLs found in sitemap after filtering"
+            }, indent=2)
+        
+        crawler = ctx.request_context.lifespan_context.crawler
+        
+        from datetime import datetime, timezone
+        run_id = generate_run_id("sitemap")
+        run_dir = ensure_run_dir(output_dir, run_id)
+        started_at = datetime.now(timezone.utc)
+        
+        # Create manifest
+        manifest = Manifest(
+            run_id=run_id,
+            entry=sitemap_url,
+            mode="sitemap",
+            started_at=started_at.isoformat(),
+            config={
+                "sitemap_url": sitemap_url,
+                "max_entries": max_entries
+            }
+        )
+        write_manifest(run_dir, manifest)
+        
+        # Crawl all URLs
+        crawl_results = await crawl_batch(crawler, safe_urls, max_concurrent=10, adaptive=False)
+        
+        pages_ok = 0
+        pages_failed = 0
+        total_bytes = 0
+        
+        # Persist each page
+        for doc in crawl_results:
+            try:
+                file_path, content_bytes = persist_page_markdown(run_dir, doc['url'], doc['markdown'])
+                
+                page_record = PageRecord(
+                    url=doc['url'],
+                    status="ok",
+                    error=None,
+                    duration_ms=0,
+                    path=file_path,
+                    content_bytes=content_bytes
+                )
+                manifest.pages.append(page_record)
+                update_totals(manifest, page_record)
+                pages_ok += 1
+                total_bytes += content_bytes
+            except Exception as e:
+                page_record = PageRecord(
+                    url=doc['url'],
+                    status="failed",
+                    error=str(e),
+                    duration_ms=0,
+                    path=None,
+                    content_bytes=None
+                )
+                manifest.pages.append(page_record)
+                update_totals(manifest, page_record)
+                pages_failed += 1
+        
+        manifest.finished_at = datetime.now(timezone.utc).isoformat()
+        write_manifest(run_dir, manifest)
+        
+        return json.dumps({
+            "success": True,
+            "run_id": run_id,
+            "output_dir": str(run_dir),
+            "manifest_path": str(run_dir / "manifest.json"),
+            "pages_ok": pages_ok,
+            "pages_failed": pages_failed,
+            "bytes_written": total_bytes,
+            "started_at": started_at.isoformat(),
+            "finished_at": manifest.finished_at
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "url": sitemap_url,
+            "error": str(e)
+        }, indent=2)
+
+@mcp.tool()
 async def perform_rag_query(ctx: Context, query: str, source: str = None, match_count: int = 5) -> str:
     """
     Perform a RAG (Retrieval Augmented Generation) query on the stored content.
@@ -1417,7 +1924,7 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[s
         print(f"Failed to crawl {url}: {result.error_message}")
         return []
 
-async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10) -> List[Dict[str, Any]]:
+async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10, adaptive: bool = False) -> List[Dict[str, Any]]:
     """
     Batch crawl multiple URLs in parallel.
     
@@ -1425,6 +1932,7 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
         crawler: AsyncWebCrawler instance
         urls: List of URLs to crawl
         max_concurrent: Maximum number of concurrent browser sessions
+        adaptive: If True, stop crawling when sufficient content is gathered
         
     Returns:
         List of dictionaries with URL and markdown content
@@ -1436,10 +1944,35 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
         max_session_permit=max_concurrent
     )
 
-    results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
-    return [{'url': r.url, 'markdown': r.markdown} for r in results if r.success and r.markdown]
+    results = []
+    page_contents = []
+    
+    # If adaptive, process URLs in batches and check if we should continue
+    if adaptive:
+        for url in urls:
+            # Safety check for each URL
+            if not is_public_http_url(url):
+                continue
+                
+            result = await crawler.arun(url=url, config=crawl_config)
+            if result.success and result.markdown:
+                results.append({'url': result.url, 'markdown': result.markdown})
+                page_contents.append(result.markdown)
+                
+                # Check if we should continue crawling
+                if not should_continue_crawling(page_contents, len(urls)):
+                    break
+    else:
+        # Non-adaptive: crawl all URLs in parallel
+        # Filter URLs for safety first
+        safe_urls = [u for u in urls if is_public_http_url(u)]
+        if safe_urls:
+            crawl_results = await crawler.arun_many(urls=safe_urls, config=crawl_config, dispatcher=dispatcher)
+            results = [{'url': r.url, 'markdown': r.markdown} for r in crawl_results if r.success and r.markdown]
+    
+    return results
 
-async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10) -> List[Dict[str, Any]]:
+async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10, adaptive: bool = False) -> List[Dict[str, Any]]:
     """
     Recursively crawl internal links from start URLs up to a maximum depth.
     
@@ -1448,6 +1981,7 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
         start_urls: List of starting URLs
         max_depth: Maximum recursion depth
         max_concurrent: Maximum number of concurrent browser sessions
+        adaptive: If True, stop crawling when sufficient content is gathered
         
     Returns:
         List of dictionaries with URL and markdown content
@@ -1460,15 +1994,17 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     )
 
     visited = set()
+    page_contents = []
 
     def normalize_url(url):
         return urldefrag(url)[0]
 
-    current_urls = set([normalize_url(u) for u in start_urls])
+    current_urls = set([normalize_url(u) for u in start_urls if is_public_http_url(u)])
     results_all = []
 
     for depth in range(max_depth):
-        urls_to_crawl = [normalize_url(url) for url in current_urls if normalize_url(url) not in visited]
+        # Filter URLs for safety
+        urls_to_crawl = [normalize_url(url) for url in current_urls if normalize_url(url) not in visited and is_public_http_url(url)]
         if not urls_to_crawl:
             break
 
@@ -1481,9 +2017,16 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
 
             if result.success and result.markdown:
                 results_all.append({'url': result.url, 'markdown': result.markdown})
+                page_contents.append(result.markdown)
+                
+                # Check adaptive stopping
+                if adaptive and not should_continue_crawling(page_contents, len(urls_to_crawl) * max_depth):
+                    return results_all
+                
                 for link in result.links.get("internal", []):
                     next_url = normalize_url(link["href"])
-                    if next_url not in visited:
+                    # Safety check for internal links
+                    if next_url not in visited and is_public_http_url(next_url):
                         next_level_urls.add(next_url)
 
         current_urls = next_level_urls
