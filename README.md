@@ -35,6 +35,10 @@ The Crawl4AI RAG MCP server is just the beginning. Here's where we're headed:
 ## Features
 
 - **Smart URL Detection**: Automatically detects and handles different URL types (regular webpages, sitemaps, text files)
+- **Safety Guards**: Blocks localhost, private IPs, and internal networks for secure crawling
+- **File Persistence**: Optional file-based storage with manifests, JSONL, and CSV exports
+- **Adaptive Crawling**: Intelligent crawling that stops when sufficient content is gathered
+- **Enhanced Sitemap Discovery**: Automatically discovers sitemaps from robots.txt
 - **Recursive Crawling**: Follows internal links to discover content
 - **Parallel Processing**: Efficiently crawls multiple pages simultaneously
 - **Content Chunking**: Intelligently splits content by headers and size for better processing
@@ -47,14 +51,42 @@ The server provides essential web crawling and search tools:
 
 ### Core Tools (Always Available)
 
-1. **`crawl_single_page`**: Quickly crawl a single web page and store its content in the vector database
-2. **`smart_crawl_url`**: Intelligently crawl a full website based on the type of URL provided (sitemap, llms-full.txt, or a regular webpage that needs to be crawled recursively)
-3. **`get_available_sources`**: Get a list of all available sources (domains) in the database
-4. **`perform_rag_query`**: Search for relevant content using semantic search with optional source filtering
+1. **`crawl_single_page`**: Quickly crawl a single web page and store its content in the vector database. Supports optional file persistence via `output_dir` parameter.
+   - Parameters: `url` (required), `output_dir` (optional)
+   - Returns: Crawl summary with chunks stored or file paths if `output_dir` provided
+
+2. **`crawl_single_page_raw`**: Crawl a single web page and return markdown content without storing in Supabase. Perfect for quick content retrieval.
+   - Parameters: `url` (required)
+   - Returns: Markdown content with metadata
+
+3. **`smart_crawl_url`**: Intelligently crawl a full website based on the type of URL provided (sitemap, llms-full.txt, or a regular webpage). Automatically discovers sitemaps from robots.txt. Supports adaptive crawling and optional file persistence.
+   - Parameters: `url` (required), `max_depth` (default: 3), `max_concurrent` (default: 10), `chunk_size` (default: 5000), `adaptive` (default: false), `output_dir` (optional)
+   - Returns: Crawl summary with storage information or file paths if `output_dir` provided
+
+4. **`smart_crawl_url_raw`**: Intelligently crawl a URL and return markdown content without storing in Supabase. Supports adaptive crawling.
+   - Parameters: `url` (required), `max_depth` (default: 3), `max_concurrent` (default: 10)
+   - Returns: All crawled pages with markdown content
+
+5. **`crawl_site`**: Comprehensive site crawling with persistence to disk. Always requires `output_dir` and returns metadata only (avoids context bloat).
+   - Parameters: `entry_url` (required), `output_dir` (required), `max_depth` (default: 2, max: 6), `max_pages` (default: 200, max: 5000), `adaptive` (default: false)
+   - Returns: Manifest path and crawl statistics
+
+6. **`crawl_sitemap`**: Crawl URLs discovered from sitemap.xml with persistence to disk. Always requires `output_dir` and returns metadata only.
+   - Parameters: `sitemap_url` (required), `output_dir` (required), `max_entries` (default: 1000)
+   - Returns: Manifest path and crawl statistics
+
+7. **`get_available_sources`**: Get a list of all available sources (domains) in the database
+   - Returns: List of sources with summaries and statistics
+
+8. **`perform_rag_query`**: Search for relevant content using semantic search with optional source filtering
+   - Parameters: `query` (required), `source` (optional), `match_count` (default: 5)
+   - Returns: Search results with similarity scores
 
 ### Conditional Tools
 
-5. **`search_code_examples`** (requires `USE_AGENTIC_RAG=true`): Search specifically for code examples and their summaries from crawled documentation. This tool provides targeted code snippet retrieval for AI coding assistants.
+9. **`search_code_examples`** (requires `USE_AGENTIC_RAG=true`): Search specifically for code examples and their summaries from crawled documentation. This tool provides targeted code snippet retrieval for AI coding assistants.
+   - Parameters: `query` (required), `source_id` (optional), `match_count` (default: 5)
+   - Returns: Code examples with summaries and similarity scores
 
 ## Prerequisites
 
@@ -302,6 +334,39 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
 }
 ```
 
+## New Features & Enhancements
+
+### Safety Guards
+All crawling tools now include safety validation that blocks:
+- `localhost` and `127.0.0.1`
+- Private IP ranges (RFC 1918)
+- `file://` schemes
+- `.local`, `.internal`, `.lan` domains
+
+This ensures that only public HTTP(S) URLs can be crawled, protecting against SSRF attacks.
+
+### File Persistence
+Tools that support file persistence (`crawl_single_page`, `smart_crawl_url`, `crawl_site`, `crawl_sitemap`) can save results to disk with:
+- **Manifests**: JSON files with crawl metadata and configuration
+- **Markdown files**: Individual page content saved as `.md` files
+- **JSONL logs**: Structured logs of all crawled pages
+- **CSV links**: Extracted links saved in CSV format
+
+This is especially useful for large crawls where returning all content would bloat the context window.
+
+### Adaptive Crawling
+When `adaptive=True` is enabled, the crawler uses intelligent stopping strategies:
+- Stops when total content exceeds threshold (default: 5,000 characters)
+- Prevents over-crawling for information gathering tasks
+- Adjusts threshold based on query complexity
+
+### Enhanced Sitemap Discovery
+The `smart_crawl_url` tool now automatically:
+- Discovers sitemaps from `robots.txt`
+- Falls back to common sitemap paths
+- Filters URLs for safety before crawling
+- Handles both sitemap.xml and sitemap index files
+
 ## Building Your Own Server
 
 This implementation provides a foundation for building more complex MCP servers with web crawling capabilities. To build your own:
@@ -310,3 +375,4 @@ This implementation provides a foundation for building more complex MCP servers 
 2. Create your own lifespan function to add your own dependencies
 3. Modify the `utils.py` file for any helper functions you need
 4. Extend the crawling capabilities by adding more specialized crawlers
+5. Use the safety, persistence, and adaptive strategy modules for consistent behavior
