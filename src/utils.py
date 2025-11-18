@@ -14,20 +14,70 @@ import time
 # Load OpenAI API key for embeddings
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-def get_supabase_client() -> Client:
+def get_supabase_client() -> Optional[Client]:
     """
     Get a Supabase client with the URL and key from environment variables.
     
     Returns:
-        Supabase client instance
+        Supabase client instance, or None if credentials are not set
+        
+    Raises:
+        ValueError: If credentials are invalid or connection fails
     """
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_SERVICE_KEY")
     
     if not url or not key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set in environment variables")
+        print("Warning: SUPABASE_URL and SUPABASE_SERVICE_KEY not set. RAG features will be disabled.")
+        return None
     
-    return create_client(url, key)
+    # Validate URL format
+    if not url.startswith(('http://', 'https://')):
+        raise ValueError(
+            f"Invalid SUPABASE_URL format: '{url}'. "
+            "URL must start with 'http://' or 'https://'. "
+            "Example: https://your-project.supabase.co"
+        )
+    
+    # Validate key is not empty
+    if not key.strip():
+        raise ValueError(
+            "SUPABASE_SERVICE_KEY is empty. "
+            "Please set a valid service key in your .env file. "
+            "You can find it in your Supabase project settings under API > service_role key."
+        )
+    
+    try:
+        client = create_client(url, key)
+        # Test connection by making a simple query
+        # This will raise an exception if credentials are invalid
+        try:
+            client.table('sources').select('source_id').limit(1).execute()
+        except Exception as test_error:
+            error_msg = str(test_error).lower()
+            if 'invalid api key' in error_msg or 'unauthorized' in error_msg or '401' in error_msg:
+                raise ValueError(
+                    f"Invalid SUPABASE_SERVICE_KEY. The service key provided is not valid. "
+                    f"Please check your Supabase project settings. Error: {test_error}"
+                )
+            elif 'not found' in error_msg or '404' in error_msg:
+                # Table might not exist yet, which is okay for initial setup
+                pass
+            else:
+                # Other connection errors
+                raise ValueError(
+                    f"Failed to connect to Supabase. Please verify your SUPABASE_URL and SUPABASE_SERVICE_KEY. "
+                    f"Error: {test_error}"
+                )
+        return client
+    except ValueError:
+        # Re-raise our custom ValueError
+        raise
+    except Exception as e:
+        raise ValueError(
+            f"Failed to create Supabase client: {e}. "
+            "Please verify your SUPABASE_URL and SUPABASE_SERVICE_KEY are correct."
+        )
 
 def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
@@ -35,12 +85,25 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     
     Args:
         texts: List of texts to create embeddings for
-        
+    
     Returns:
         List of embeddings (each embedding is a list of floats)
+        
+    Raises:
+        ValueError: If OpenAI API key is missing or invalid
+        Exception: For other API errors
     """
     if not texts:
         return []
+    
+    # Check if API key is set
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key or not api_key.strip():
+        raise ValueError(
+            "OPENAI_API_KEY is not set. "
+            "Please set your OpenAI API key in the .env file. "
+            "You can get your API key from https://platform.openai.com/api-keys"
+        )
     
     max_retries = 3
     retry_delay = 1.0  # Start with 1 second delay
@@ -52,6 +115,37 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
                 input=texts
             )
             return [item.embedding for item in response.data]
+        except openai.AuthenticationError as e:
+            raise ValueError(
+                f"Invalid OPENAI_API_KEY. The API key provided is not valid. "
+                f"Please check your .env file. Error: {e}"
+            )
+        except openai.RateLimitError as e:
+            if retry < max_retries - 1:
+                print(f"Rate limit exceeded (attempt {retry + 1}/{max_retries}). Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                raise ValueError(
+                    f"OpenAI API rate limit exceeded after {max_retries} attempts. "
+                    f"Please wait a moment and try again. Error: {e}"
+                )
+        except openai.APIError as e:
+            error_msg = str(e).lower()
+            if 'insufficient_quota' in error_msg or 'billing' in error_msg:
+                raise ValueError(
+                    f"OpenAI API billing/quota issue. Please check your OpenAI account billing. Error: {e}"
+                )
+            elif retry < max_retries - 1:
+                print(f"OpenAI API error (attempt {retry + 1}/{max_retries}): {e}")
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                raise ValueError(
+                    f"OpenAI API error after {max_retries} attempts: {e}. "
+                    "Please check your API key and account status."
+                )
         except Exception as e:
             if retry < max_retries - 1:
                 print(f"Error creating batch embeddings (attempt {retry + 1}/{max_retries}): {e}")
