@@ -1,12 +1,23 @@
 <h1 align="center">Crawl4AI RAG MCP Server</h1>
 
 <p align="center">
-  <em>Web Crawling and RAG Capabilities for AI Agents and AI Coding Assistants</em>
+  <em>Web Crawling, RAG, and SEO Analysis for AI Agents and AI Coding Assistants</em>
 </p>
 
-A powerful implementation of the [Model Context Protocol (MCP)](https://modelcontextprotocol.io) integrated with [Crawl4AI](https://crawl4ai.com) and [Supabase](https://supabase.com/) for providing AI agents and AI coding assistants with advanced web crawling and RAG capabilities.
+<p align="center">
+  <a href="#features">Features</a> •
+  <a href="#tools">Tools</a> •
+  <a href="MCP_TOOLS.md">Full API Reference</a> •
+  <a href="#installation">Installation</a> •
+  <a href="#configuration">Configuration</a>
+</p>
 
-With this MCP server, you can <b>scrape anything</b> and then <b>use that knowledge anywhere</b> for RAG.
+A powerful implementation of the [Model Context Protocol (MCP)](https://modelcontextprotocol.io) integrated with [Crawl4AI](https://crawl4ai.com) and [Supabase](https://supabase.com/) for providing AI agents and AI coding assistants with advanced web crawling, RAG capabilities, and **comprehensive SEO analysis**.
+
+With this MCP server, you can:
+- **Scrape anything** and use that knowledge anywhere for RAG
+- **Analyze SEO** with full audits including meta tags, accessibility, readability, and AI-readiness
+- **Check AI compatibility** via `llms.txt` and `robots.txt` analysis
 
 ## Overview
 
@@ -34,6 +45,7 @@ The Crawl4AI RAG MCP server is just the beginning. Here's where we're headed:
 
 ## Features
 
+### Core Crawling
 - **Smart URL Detection**: Automatically detects and handles different URL types (regular webpages, sitemaps, text files)
 - **Safety Guards**: Blocks localhost, private IPs, and internal networks for secure crawling
 - **File Persistence**: Optional file-based storage with manifests, JSONL, and CSV exports
@@ -42,51 +54,105 @@ The Crawl4AI RAG MCP server is just the beginning. Here's where we're headed:
 - **Recursive Crawling**: Follows internal links to discover content
 - **Parallel Processing**: Efficiently crawls multiple pages simultaneously
 - **Content Chunking**: Intelligently splits content by headers and size for better processing
+
+### RAG Capabilities
 - **Vector Search**: Performs RAG over crawled content, optionally filtering by data source for precision
 - **Source Retrieval**: Retrieve sources available for filtering to guide the RAG process
+- **Hybrid Search**: Combines keyword and semantic search for better results
+- **Code Example Search**: Specialized search for code snippets from documentation
+
+### SEO Analysis
+- **Full SEO Audits**: Comprehensive analysis with weighted scoring
+- **Meta Tag Analysis**: Title, description, Open Graph, Twitter Cards, JSON-LD
+- **Page Structure**: Heading hierarchy, image alt text, internal/external links
+- **Accessibility Audit**: ARIA labels, skip links, form labels, lang attribute
+- **Readability Analysis**: Flesch-Kincaid scoring for content complexity
+- **AI-Readiness Check**: `llms.txt` and `robots.txt` analysis for AI bot access
+- **Broken Link Detection**: HTTP status checking for all page links
+
+### Browser Automation
+- **Screenshot Capture**: Capture full-page or viewport screenshots as base64 PNG
+- **PDF Generation**: Convert any webpage to PDF document
+- **JavaScript Execution**: Run custom JS scripts on pages
+- **Page Actions**: Click, type, scroll, wait - interact with dynamic content and SPAs
 
 ## Tools
 
-The server provides essential web crawling and search tools:
+The server provides **22 tools** across four categories. For complete API documentation, see **[MCP_TOOLS.md](MCP_TOOLS.md)**.
 
-### Core Tools (Always Available)
+### Crawling Tools (6 tools)
 
-1. **`crawl_single_page`**: Quickly crawl a single web page and store its content in the vector database. Supports optional file persistence via `output_dir` parameter.
-   - Parameters: `url` (required), `output_dir` (optional)
-   - Returns: Crawl summary with chunks stored or file paths if `output_dir` provided
+| Tool | Description | Storage |
+|------|-------------|---------|
+| `crawl_single_page` | Crawl a single URL | Supabase |
+| `crawl_single_page_raw` | Crawl and return content directly | None |
+| `smart_crawl_url` | Intelligent crawling (sitemap/page detection) | Supabase |
+| `smart_crawl_url_raw` | Smart crawl, return content directly | None |
+| `crawl_site` | Full site crawl with disk persistence | Disk |
+| `crawl_sitemap` | Crawl all URLs from sitemap.xml | Disk |
 
-2. **`crawl_single_page_raw`**: Crawl a single web page and return markdown content without storing in Supabase. Perfect for quick content retrieval.
-   - Parameters: `url` (required)
-   - Returns: Markdown content with metadata
+### RAG & Search Tools (3 tools)
 
-3. **`smart_crawl_url`**: Intelligently crawl a full website based on the type of URL provided (sitemap, llms-full.txt, or a regular webpage). Automatically discovers sitemaps from robots.txt. Supports adaptive crawling and optional file persistence.
-   - Parameters: `url` (required), `max_depth` (default: 3), `max_concurrent` (default: 10), `chunk_size` (default: 5000), `adaptive` (default: false), `output_dir` (optional)
-   - Returns: Crawl summary with storage information or file paths if `output_dir` provided
+| Tool | Description | Condition |
+|------|-------------|-----------|
+| `get_available_sources` | List all indexed sources | Always |
+| `perform_rag_query` | Semantic search with optional filtering | Always |
+| `search_code_examples` | Search code snippets from docs | `USE_AGENTIC_RAG=true` |
 
-4. **`smart_crawl_url_raw`**: Intelligently crawl a URL and return markdown content without storing in Supabase. Supports adaptive crawling.
-   - Parameters: `url` (required), `max_depth` (default: 3), `max_concurrent` (default: 10)
-   - Returns: All crawled pages with markdown content
+### SEO Analysis Tools (9 tools)
 
-5. **`crawl_site`**: Comprehensive site crawling with persistence to disk. Always requires `output_dir` and returns metadata only (avoids context bloat).
-   - Parameters: `entry_url` (required), `output_dir` (required), `max_depth` (default: 2, max: 6), `max_pages` (default: 200, max: 5000), `adaptive` (default: false)
-   - Returns: Manifest path and crawl statistics
+| Tool | Description |
+|------|-------------|
+| `get_raw_html` | Get raw HTML content (like Firecrawl) |
+| `extract_seo_metadata` | Title, meta tags, OG, Twitter Cards, JSON-LD |
+| `extract_page_structure` | Headings, images, links analysis |
+| `check_broken_links` | HTTP status check for all links |
+| `analyze_robots_txt` | Parse robots.txt directives & AI bot access |
+| `check_llms_txt` | Check for AI permission files |
+| `analyze_accessibility` | ARIA, alt text, skip links, form labels |
+| `analyze_readability` | Flesch-Kincaid readability score |
+| `full_seo_audit` | **Complete SEO audit** (runs all above in parallel) |
 
-6. **`crawl_sitemap`**: Crawl URLs discovered from sitemap.xml with persistence to disk. Always requires `output_dir` and returns metadata only.
-   - Parameters: `sitemap_url` (required), `output_dir` (required), `max_entries` (default: 1000)
-   - Returns: Manifest path and crawl statistics
+### Browser Automation Tools (4 tools)
 
-7. **`get_available_sources`**: Get a list of all available sources (domains) in the database
-   - Returns: List of sources with summaries and statistics
+| Tool | Description |
+|------|-------------|
+| `capture_screenshot` | Capture webpage as base64 PNG image |
+| `generate_pdf` | Convert webpage to PDF document |
+| `execute_javascript` | Run custom JavaScript on pages |
+| `crawl_with_actions` | Interact with page (click, type, scroll, wait) then scrape |
 
-8. **`perform_rag_query`**: Search for relevant content using semantic search with optional source filtering
-   - Parameters: `query` (required), `source` (optional), `match_count` (default: 5)
-   - Returns: Search results with similarity scores
+### Quick Example: Full SEO Audit
 
-### Conditional Tools
+```json
+{
+  "tool": "full_seo_audit",
+  "arguments": {
+    "url": "https://example.com"
+  }
+}
+```
 
-9. **`search_code_examples`** (requires `USE_AGENTIC_RAG=true`): Search specifically for code examples and their summaries from crawled documentation. This tool provides targeted code snippet retrieval for AI coding assistants.
-   - Parameters: `query` (required), `source_id` (optional), `match_count` (default: 5)
-   - Returns: Code examples with summaries and similarity scores
+**Returns:**
+```json
+{
+  "seo_score": 72,
+  "total_issues": 5,
+  "component_scores": {
+    "meta_tags": 85,
+    "structure": 70,
+    "robots": 100,
+    "llms": 100,
+    "accessibility": 55,
+    "readability": 45
+  },
+  "all_issues": [
+    "Title too short (35 chars)",
+    "12 images missing alt text",
+    "No skip-to-content link"
+  ]
+}
+```
 
 ## Prerequisites
 

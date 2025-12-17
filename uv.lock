@@ -332,8 +332,11 @@ name = "crawl4ai-mcp"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "aiohttp" },
+    { name = "beautifulsoup4" },
     { name = "crawl4ai" },
     { name = "dotenv" },
+    { name = "httpx" },
     { name = "mcp" },
     { name = "openai" },
     { name = "sentence-transformers" },
@@ -342,8 +345,11 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.11.0" },
+    { name = "beautifulsoup4", specifier = ">=4.12.0" },
     { name = "crawl4ai", specifier = "==0.6.2" },
     { name = "dotenv", specifier = "==0.9.9" },
+    { name = "httpx", specifier = ">=0.27,<1.0" },
     { name = "mcp", specifier = "==1.7.1" },
     { name = "openai", specifier = "==1.71.0" },
     { name = "sentence-transformers", specifier = ">=4.1.0" },
