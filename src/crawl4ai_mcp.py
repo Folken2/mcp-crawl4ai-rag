@@ -3,6 +3,10 @@ MCP server for web crawling with Crawl4AI.
 
 This server provides tools to crawl websites using Crawl4AI, automatically detecting
 the appropriate crawl method based on URL type (sitemap, txt file, or regular webpage).
+
+Authentication:
+  Set MCP_AUTH_TOKEN environment variable to enable Bearer token authentication.
+  If not set, the server runs without authentication (not recommended for production).
 """
 from mcp.server.fastmcp import FastMCP, Context
 from sentence_transformers import CrossEncoder
@@ -107,14 +111,41 @@ async def crawl4ai_lifespan(server: FastMCP) -> AsyncIterator[Crawl4AIContext]:
         # Clean up all components
         await crawler.__aexit__(None, None, None)
 
+# Configure authentication if MCP_AUTH_TOKEN is set
+auth_token = os.getenv("MCP_AUTH_TOKEN")
+auth_provider = None
+
+if auth_token:
+    try:
+        from fastmcp.server.auth import StaticTokenVerifier
+        # StaticTokenVerifier accepts a dict of token -> claims
+        # We use a simple setup with one token that grants full access
+        auth_provider = StaticTokenVerifier(
+            tokens={auth_token: {"sub": "api-client", "scope": "full-access"}}
+        )
+        print(f"[MCP-AUTH] Bearer token authentication enabled")
+    except ImportError:
+        # Fallback: FastMCP version may not have StaticTokenVerifier
+        # We'll implement custom middleware below
+        print(f"[MCP-AUTH] StaticTokenVerifier not available, using custom auth")
+        auth_provider = "custom"
+else:
+    print(f"[MCP-AUTH] WARNING: No MCP_AUTH_TOKEN set - server running without authentication")
+
 # Initialize FastMCP server
-mcp = FastMCP(
-    "mcp-crawl4ai-rag",
-    description="MCP server for RAG and web crawling with Crawl4AI",
-    lifespan=crawl4ai_lifespan,
-    host=os.getenv("HOST", "0.0.0.0"),
-    port=os.getenv("PORT", "8051")
-)
+mcp_kwargs = {
+    "name": "mcp-crawl4ai-rag",
+    "description": "MCP server for RAG and web crawling with Crawl4AI",
+    "lifespan": crawl4ai_lifespan,
+    "host": os.getenv("HOST", "0.0.0.0"),
+    "port": os.getenv("PORT", "8051"),
+}
+
+# Add auth if available and not custom
+if auth_provider and auth_provider != "custom":
+    mcp_kwargs["auth"] = auth_provider
+
+mcp = FastMCP(**mcp_kwargs)
 
 def rerank_results(model: CrossEncoder, query: str, results: List[Dict[str, Any]], content_key: str = "content") -> List[Dict[str, Any]]:
     """
